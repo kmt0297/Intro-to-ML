@@ -1,0 +1,618 @@
+---
+title: "group6_final_project_ml_STA_S380_2pm"
+output:
+  html_document:
+    df_print: paged
+date: "2024-07-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries, echo = FALSE}
+
+library(tidyverse)
+library(dplyr)
+library(gbm)
+library(tree)
+library(rpart)
+library(caret)
+library(MASS)
+library(randomForest)
+library(rpart.plot)
+library(leaps)
+library(glmnet)
+library(ggplot2)
+
+set.seed(1)
+```
+
+**EDA:** Our first step is to read in our data and explore the data set. The Kaggle website for the data set had relatively complete variable descriptions, as well as information about their ranges. The time signature had a value of zero, which wouldn't be possible (the data description noted that time signatures could only be 3/4, 4/4, 5/4/, 6/4 and 7/4).
+
+```{r EDA Part 1, echo = FALSE}
+spotify = read.csv("spotify_dataset.csv")
+summary(spotify)
+
+# Data Citation: https://www.kaggle.com/datasets/maharshipandya/-spotify-tracks-dataset/data
+
+```
+
+**Removing impossible time signatures** We called our dataset filtered_spotify once we started removing duplicates, filtering it etc. The dataset is further subdivided later when we start one-hot encoding variables and performing principal components analysis.
+
+```{r filtering}
+
+
+filtered_spotify <- 
+  spotify %>% 
+  filter(
+    time_signature %in% c(3, 4, 5, 6, 7))
+
+attach(filtered_spotify)
+
+```
+
+**Remove missing values + duplicates**
+``` {r Remove missing values + duplicates}
+
+
+# No missing values:
+
+sum_isna <- sum(is.na(filtered_spotify))
+#sum_isna
+
+# Count duplicates:
+
+sum(duplicated(track_id))
+
+# Remove duplicates that have the same track_name, artists and only keep the most popular song
+filtered_spotify <-
+  filtered_spotify %>%
+  group_by(track_name, artists) %>% 
+  filter(popularity == max(popularity))
+
+# View duplicate track_ids
+duplicates_sorted <- filtered_spotify %>%
+  group_by(track_id) %>%
+  filter(n() > 1) %>%
+  arrange(track_id)
+ 
+# Some songs have the same track_id but are in different genres. We used sample_n() to randomly pick a single genre for each track_id. 
+
+filtered_spotify <-
+  filtered_spotify %>% 
+  group_by(track_id) %>% 
+  sample_n(1)
+  
+duplicates_sorted_2 <- filtered_spotify %>%
+  group_by(track_id) %>%
+  filter(n() > 1) %>%
+  arrange(track_id)
+  
+```
+
+``` {r Converting Variables to Factors}
+
+
+# Convert mode and key to factors and turn genre into a binary variable (pop or not pop), make some other categorical variables. Change duration_ms into minutes.
+
+regular_data <-
+  filtered_spotify %>% 
+  mutate(mode = factor(mode),
+         key = factor(key),
+         explicit = factor(explicit, levels = c("True", "False")),
+         track_genre = factor(ifelse(grepl("pop", track_genre, ignore.case = TRUE), "Pop", "Not_Pop"), levels = c("Pop", "Not_Pop")),
+         )
+
+``` 
+
+**One-Hot Encoding** Some of the variables had skewed ranges (e.g. most of the values were very low with only a few approaching 1), or were described as categories but represented numerically (e.g. speechiness, which was described in thirds). We thought one-hot encoding these might improve our model. 
+
+``` {r New Datasets}
+tempo_bottom_third = min(tempo) + (max(tempo) - min(tempo)) / 3
+tempo_top_third = max(tempo) - (max(tempo) - min(tempo)) / 3
+  
+one_hot_encoded <-
+  filtered_spotify %>% 
+  mutate(mode = factor(mode),
+         key = factor(key),
+         explicit = factor(explicit, levels = c("True", "False")),
+         track_genre = factor(ifelse(grepl("pop", track_genre, ignore.case = TRUE), "Pop", "Not_Pop"), levels = c("Pop", "Not_Pop")),
+         instrumentalness = factor(ifelse(instrumentalness >= 0.2, "Instrumental", "Not_Instrumental"), levels = c("Instrumental", "Not_Instrumental")),
+         spoken_word = factor(ifelse(speechiness >= 0.66, "yes", "no"), levels = c("yes", "no")),
+         average_speech = factor(ifelse((speechiness < 0.66) & (speechiness >= 0.33), "yes", "no"), levels = c("yes", "no")),
+         no_speech = factor(ifelse(speechiness < 0.33, "yes", "no"), levels = c("yes", "no")),
+         slow = factor(ifelse(tempo <= tempo_bottom_third, "slow", "not_slow")),
+    medium = factor(ifelse(tempo > tempo_bottom_third & tempo < tempo_top_third, "medium", "not_medium"), levels = c("medium", "not_medium")),
+    fast = factor(ifelse(tempo >= tempo_top_third, "fast", "not_fast"), levels = c("fast", "not_fast"))
+         )
+
+```
+
+**Removing Columns** We wanted to remove all information about the artists from the data set. We wanted to know whether a song's intrinsic qualities could predict its popularity. 
+
+```{r Removing Columns}
+
+regular_data <- subset(regular_data, select = -c(X, track_id, track_name, album_name, artists))
+one_hot_encoded <- subset(one_hot_encoded, select = -c(X, track_id, track_name, album_name, artists, speechiness, instrumentalness, tempo))
+
+```
+
+**Removing Outliers** There were three obvious outliers in the linear regression, so we decided to remove those three from the dataset. 
+```{r Removing Outliers}
+
+# Removing outliers from data:
+regular_data <- regular_data[-c(13795, 55236, 68307), ]
+one_hot_encoded <- one_hot_encoded[-c(13795, 55236, 68307), ]
+
+```
+
+**Filtering to 10k Rows** Our models were taking hours to run (if they ran at all). Our filtered dataset consisted of approximately 80,000 rows. Professor Murray suggested we reduce the dataset to 10,000 rows in order to make the runtimes more manageable. 
+
+``` {r Filtered to 10k Rows}
+
+regular_data <- regular_data[sample(nrow(regular_data), 10000) , ]
+one_hot_encoded <- one_hot_encoded[sample(nrow(one_hot_encoded), 10000) , ]
+# Citation: https://stackoverflow.com/questions/8273313/sample-random-rows-in-dataframe
+```
+
+**Train-Test Split** The data needs to be split into a training and test set. We chose to use the standard 80/20 split. We chose to create new indices for the regular dataset and the one-hot encoded datasets to keep all of the variables clear. 
+
+``` {r Train-Test Split}
+# Train-test Split
+
+regular_train_indices <- createDataPartition(regular_data$popularity,
+                               p = 0.8)
+one_hot_indices<- createDataPartition(one_hot_encoded$popularity,
+                               p = 0.8)
+
+regular_train <- regular_data[regular_train_indices$Resample1,]
+regular_test <- regular_data[-regular_train_indices$Resample1,]
+
+one_hot_train <- one_hot_encoded[one_hot_indices$Resample1,]
+one_hot_test <- one_hot_encoded[-one_hot_indices$Resample1,]
+
+```
+
+**Create Cross-Validation Folds**
+
+``` {r Cross-Validation Folds}
+
+kcv = 10
+
+regular_cv_folds = createFolds(regular_train$popularity,
+                       k = kcv)
+one_hot_cv_folds = createFolds(one_hot_train$popularity,
+                       k = kcv)
+
+regular_fit_control <- trainControl(
+  method = "cv",
+  indexOut = regular_cv_folds,
+  selectionFunction="oneSE")
+
+one_hot_fit_control <- trainControl(
+  method = "cv",
+  indexOut = one_hot_cv_folds,
+  selectionFunction="oneSE")
+```
+
+**PCA Dataset** The one-hot encoding did not improve our model, so we decided to try PCA.
+
+``` {r PCA Dataset}
+data_standardized <- regular_data[, !(names(regular_data) %in% c("key", "mode", "explicit","popularity", "track_genre"))]
+View(data_standardized)
+#PC
+pc <- prcomp(data_standardized, center = TRUE, scale. = TRUE)
+# Calculate explained variance
+explained_variance <- pc$sdev^2 / sum(pc$sdev^2)
+
+# Create a Scree plot with better labeling
+plot(explained_variance, type = 'b', xlab = 'Principal Component', ylab = 'Proportion of Variance Explained', main = 'Scree Plot')
+
+# Calculate cumulative explained variance
+cumulative_variance <- cumsum(explained_variance)
+
+# Plot cumulative explained variance
+plot(cumulative_variance, type = 'b', xlab = 'Number of Principal Components', ylab = 'Cumulative Proportion of Variance Explained', main = 'Cumulative Explained Variance')
+
+
+# Select the first 8 principal components
+selected_pcs <- pc$x[, 1:6]
+
+
+# Create a data frame from the selected principal components
+pc_df <- data.frame(selected_pcs)
+
+
+# Extract the factor variables from the original dataset using base R
+factor_vars <- regular_data[, c("key", "mode", "explicit", "track_genre")]
+
+# Check the structure of the factor variables
+str(factor_vars)
+
+# Combine the principal components with the factor variables
+pca_data <- cbind(pc_df, factor_vars, popularity = regular_data$popularity)
+
+# Check the structure of the combined data
+str(pca_data)
+
+# PCA Train-Test Split
+
+pca_indices <- createDataPartition(pca_data$popularity,
+                               p = 0.8)
+
+
+pca_train <- pca_data[pca_indices$Resample1,]
+pca_test <- pca_data[-pca_indices$Resample1,]
+
+
+
+pca_cv_folds = createFolds(pca_train$popularity,
+                       k = kcv)
+
+pca_fit_control <- trainControl(
+  method = "cv",
+  indexOut = pca_cv_folds,
+  selectionFunction="oneSE")
+
+```
+**Linear Regression Model**
+``` {r Linear Regression}
+# Fit regsubsets model on the training data
+regfit <- regsubsets(popularity ~ ., data = regular_train, nvmax = 30, really.big = TRUE) # nvmax adjusts number of variables # really.big = true allows for a big search
+
+# Create a function to calculate RMSE
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2)) }
+
+# Evaluate models on the training data (In-Sample)
+trainX <- model.matrix(popularity ~ ., regular_train) # predictor matrix for training data
+trainY <- regular_train$popularity # response vector for training data
+
+# Evaluate models on the test data (Out-of-Sample)
+# testX views predictors
+testX <- model.matrix(popularity ~ ., regular_test) # predictor matrix for test data
+# testY compares response variable actual values vs predicted
+testY <- regular_test$popularity # response vector
+
+# Citation: asked ChatGPT how to dynamically adjust number of predictors
+# Get the actual number of predictors used in the regfit object
+num_predictors <- length(summary(regfit)$outmat[1,])
+
+# Citation: asked ChatGPT how to store values
+# Create vectors to store RMSE values for each model
+# rep() repeats vector x 
+rmse_train_values <- rep(NA, num_predictors)
+rmse_test_values <- rep(NA, num_predictors)
+
+# Loop over each model size from 1 to number of predictors
+for (i in 1:num_predictors) {
+  # Get the coefficients of the i-th model from the regsubsets result
+  # 'id = i' specifies which model to extract, starting from 1 until id = nvmax
+  coef_i <- coef(regfit, id = i)
+  
+  # In-Sample Prediction
+  pred_train_i <- trainX[, names(coef_i)] %*% coef_i
+  rmse_train_values[i] <- rmse(trainY, pred_train_i)
+
+  # Out-of-Sample Prediction
+  # Predict the response variable using the i-th model coefficients
+  # We select only the columns corresponding to the predictors included in the i-th model
+    # '%*%' is the matrix multiplication operator in R, calculates predicted values.
+  pred_test_i <- testX[, names(coef_i)] %*% coef_i
+  # Calculate the RMSE for the i-th model's predictions on the test data
+  rmse_test_values[i] <- rmse(testY, pred_test_i)
+  
+  # Print (concatenate) the details of the i-nth model
+  cat("\nModel with", i, "predictors\n")
+  cat("Predictors:", names(coef_i), "\n")
+  cat("In-Sample RMSE:", rmse_train_values[i], "\n")
+  cat("Out-of-Sample RMSE:", rmse_test_values[i], "\n")
+}
+
+# Identify the model with the lowest RMSE (In-Sample)
+best_in_sample_index <- which.min(rmse_train_values)
+best_in_sample_rmse <- rmse_train_values[best_in_sample_index]
+
+# Identify the model with the lowest RMSE (Out-of-Sample)
+best_out_sample_index <- which.min(rmse_test_values)
+best_out_sample_rmse <- rmse_test_values[best_out_sample_index]
+
+# Output the best model indices and their RMSEs
+print(paste("Best in-sample model index:", best_in_sample_index))
+print(paste("Best in-sample RMSE:", best_in_sample_rmse))
+
+print(paste("Best out-of-sample model index:", best_out_sample_index))
+print(paste("Best out-of-sample RMSE:", best_out_sample_rmse))
+
+# Get the coefficients of the best in-sample model
+best_in_sample_coef <- coef(regfit, id = best_in_sample_index)
+print("Coefficients of the best in-sample model:")
+print(best_in_sample_coef)
+
+# Get the coefficients of the best out-of-sample model
+best_out_sample_coef <- coef(regfit, id = best_out_sample_index)
+print("Coefficients of the best out-of-sample model:")
+print(best_out_sample_coef)
+
+
+# Plotting
+rmse_df <- data.frame(
+  Model = 1:num_predictors,
+  InSampleRMSE = rmse_train_values,
+  OutSampleRMSE = rmse_test_values
+)
+
+
+# Plot the RMSE values
+ggplot(rmse_df, aes(x = Model)) +
+  geom_line(aes(y = InSampleRMSE, color = "In-Sample RMSE")) +
+  geom_line(aes(y = OutSampleRMSE, color = "Out-of-Sample RMSE")) +
+  geom_point(aes(y = InSampleRMSE, color = "In-Sample RMSE")) +
+  geom_point(aes(y = OutSampleRMSE, color = "Out-of-Sample RMSE")) +
+  labs(title = "RMSE vs. Number of Predictors",
+       x = "Number of Predictors",
+       y = "RMSE",
+       color = "RMSE Type") +
+  theme_minimal()
+
+
+```
+Shrinkage lasso and ridge (reg)
+```{r}
+# Prepare the data
+trainX <- model.matrix(popularity ~ ., regular_train)[, -1] # Predictor matrix for training
+trainY <- regular_train$popularity # Response vector for training
+testX <- model.matrix(popularity ~ ., regular_test)[, -1] # Predictor matrix for testing
+testY <- regular_test$popularity # Response vector for testing
+
+# Create a function to calculate RMSE
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+# Citation: asked ChatGPT how to determine the minimum RSE with lasso and ridge
+# Fit a Lasso regression model
+# Lasso sets some variable coefficients to 0 (effectively removing them)
+lasso_fit <- cv.glmnet(trainX, trainY, alpha = 1) # alpha = 1 for Lasso
+
+# Predict and calculate in-sample RMSE for Lasso
+lasso_in_sample_pred <- predict(lasso_fit, s = "lambda.min", newx = trainX)
+lasso_in_sample_rmse <- rmse(trainY, lasso_in_sample_pred)
+
+# Predict and calculate out-of-sample RMSE for Lasso
+lasso_out_sample_pred <- predict(lasso_fit, s = "lambda.min", newx = testX)
+lasso_out_sample_rmse <- rmse(testY, lasso_out_sample_pred)
+
+lasso_coef <- coef(lasso_fit, s = "lambda.min")
+print(lasso_coef)
+
+# Fit a Ridge regression model
+# Ridge shrinks the coefficients but never removes the variables (zero)
+ridge_fit <- cv.glmnet(trainX, trainY, alpha = 0) # alpha = 0 for Ridge
+
+# Predict and calculate in-sample RMSE for Ridge
+ridge_in_sample_pred <- predict(ridge_fit, s = "lambda.min", newx = trainX)
+ridge_in_sample_rmse <- rmse(trainY, ridge_in_sample_pred)
+
+# Predict and calculate out-of-sample RMSE for Ridge
+ridge_out_sample_pred <- predict(ridge_fit, s = "lambda.min", newx = testX)
+ridge_out_sample_rmse <- rmse(testY, ridge_out_sample_pred)
+
+ridge_coef <- coef(ridge_fit, s = "lambda.min")
+print(ridge_coef)
+
+# Print the RMSE for both models
+print(paste("Lasso In-Sample RMSE:", lasso_in_sample_rmse))
+print(paste("Lasso Out-of-Sample RMSE:", lasso_out_sample_rmse))
+print(paste("Ridge In-Sample RMSE:", ridge_in_sample_rmse))
+print(paste("Ridge Out-of-Sample RMSE:", ridge_out_sample_rmse))
+
+# Lasso produces slightly better rmse
+# Lasso tends to perform better when a small number of predictors have a strong effect on Y
+
+# Citation: asked ChatGPT how to plot and scale rmse values by method
+# Create a data frame for plotting
+rmse_methods_df <- data.frame(
+  Method = c("Subset Selection In-Sample", "Subset Selection Out-of-Sample", 
+             "Lasso In-Sample", "Lasso Out-of-Sample", 
+             "Ridge In-Sample", "Ridge Out-of-Sample"),
+  RMSE = c(best_in_sample_rmse, best_out_sample_rmse, 
+           lasso_in_sample_rmse, lasso_out_sample_rmse, 
+           ridge_in_sample_rmse, ridge_out_sample_rmse)
+)
+
+# Plot the RMSE values for different methods with a zoomed-in view
+ggplot(rmse_methods_df, aes(x = Method, y = RMSE)) +
+  geom_bar(stat = "identity") +
+  labs(title = "RMSE Comparison of Different Methods",
+       x = "Method",
+       y = "RMSE") +
+  theme_minimal() +
+  scale_y_continuous(limits = c(0, max(rmse_methods_df$RMSE) * 1.1), labels = scales::number_format(accuracy = 0.001)) +
+  geom_text(aes(label = sprintf("%.3f", RMSE)), vjust = -0.5, size = 3.5) +
+  coord_cartesian(ylim = c(min(rmse_methods_df$RMSE) - 0.1, max(rmse_methods_df$RMSE) + 0.1)) + # zooms in on y-axis
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+**Random Forest**
+
+```{r Random Forest}
+r_rf_model_cv <- train(
+  popularity ~ ., 
+  data = regular_train, 
+  method = "rf", 
+  trControl = regular_fit_control,
+  tuneGrid = data.frame(mtry = sqrt(ncol(regular_train) - 1)),
+  ntree = 500,
+  metric = "RMSE",
+  preProcess = c("center", "scale")
+)
+print(r_rf_model_cv)
+
+# Make predictions on the testing set
+r_predictions <- predict(r_rf_model_cv, newdata = regular_test)
+library(ggplot2)
+
+# Calculate RMSE
+r_rmse <- sqrt(mean((r_predictions - regular_test$popularity)^2))
+cat("RMSE:", r_rmse, "\n")
+# Plot variable importance
+varImpPlot(r_rf_model)
+
+#plot # of trees necessary 
+plot(r_rf_model)
+
+#PLOT predicted vs actual
+library(ggplot2)
+pred_vs_actual <- data.frame(Actual = regular_test$popularity, Predicted = r_predictions)
+
+
+ggplot(pred_vs_actual, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predicted vs Actual Values", x = "Actual Values", y = "Predicted Values")
+
+
+#RF on ONE-HOT ENCODED DATA
+one_hot_train <- one_hot_encoded[one_hot_indices$Resample1,]
+one_hot_test <- one_hot_encoded[-one_hot_indices$Resample1,]
+one_hot_cv_folds = createFolds(one_hot_train$popularity,
+                       k = kcv)
+one_hot_fit_control <- trainControl(
+  method = "cv",
+  indexOut = one_hot_cv_folds,
+  selectionFunction="oneSE")     
+
+ohe_model_cv <- train(
+  popularity ~ ., 
+  data = one_hot_train, 
+  method = "rf", 
+  trControl = one_hot_fit_control,
+  tuneGrid = data.frame(mtry = sqrt(ncol(one_hot_train) - 1)),
+  ntree = 500,
+  metric = "RMSE",
+  preProcess = c("center", "scale")
+)
+print(ohe_model_cv)
+View(one_hot_test)
+ohe_predictions <- predict(ohe_model_cv, newdata = one_hot_test)
+
+# Calculate RMSE
+ohe_rmse <- sqrt(mean((ohe_predictions - one_hot_test$popularity)^2))
+cat("RMSE:", ohe_rmse, "\n")
+
+
+
+
+# PRINCIPLE COMPONENT ANALYSIS 
+pca_fit_control <- trainControl(
+  method = "cv", 
+  indexOut = pca_cv_folds,
+  selectionFunction = "oneSE"
+)
+
+#RF ON PCA DATA
+pca_rf_model_cv <- train(
+  popularity ~ ., 
+  data = pca_train, 
+  method = "rf", 
+  trControl = pca_fit_control,
+  tuneGrid = data.frame(mtry = sqrt(ncol(pca_train) - 1)),
+  ntree = 500,
+  metric = "RMSE",
+  preProcess = c("center", "scale")
+)
+print(pca_rf_model_cv)
+# Make predictions on the testing set
+predictions <- predict(pca_rf_model_cv, newdata = pca_test)
+
+# Calculate RMSE
+pca_rmse <- sqrt(mean((predictions - pca_test$popularity)^2))
+cat("RMSE:", pca_rmse, "\n")
+```
+
+**Boosting**
+*Boosting on the Regular Dataset*
+``` {r Regular Data Boosting}
+r_boost_model_standard <- train(popularity ~ ., data = regular_train, 
+                 method = "gbm", 
+                 trControl = regular_fit_control,
+                 verbose = FALSE)
+
+print(r_boost_model_standard)
+plot(r_boost_model_standard)
+
+
+boost_model_grid <-  expand.grid(interaction.depth = c(1, 3, 5, 10), 
+                        n.trees = c(100, 500, 1000, 5000), 
+                        shrinkage = c(0.1),
+                        n.minobsinnode = 10)
+
+r_boost_model_optimized <- train(popularity ~ .,
+                data = regular_train,
+                method = "gbm",
+                trControl = regular_fit_control,
+                tuneGrid = boost_model_grid,
+                verbose = FALSE)
+print(r_boost_model_optimized)
+plot(r_boost_model_optimized)
+
+r_boost_model_optimized_rds <- write_rds(r_boost_model_optimized, "r_boost_model_optimized.rds")
+
+```
+
+*Boosting on the One-Hot Encoded Dataset*
+``` {r One-Hot Boosting}
+one_hot_boost_model_optimized <- train(popularity ~ .,
+                data = one_hot_train,
+                method = "gbm",
+                trControl = one_hot_fit_control,
+                tuneGrid = boost_model_grid,
+                verbose = FALSE)
+print(one_hot_boost_model_optimized)
+plot(one_hot_boost_model_optimized)
+
+one_hot_boost_model_optimized_rds <- write_rds(one_hot_boost_model_optimized, "one_hot_boost_model_optimized.rds")
+
+```
+
+*Boosting on the PCA Dataset*
+``` {r PCA Boosting}
+pca_model_optimized <- train(popularity ~ .,
+                data = pca_train,
+                method = "gbm",
+                trControl = pca_fit_control,
+                tuneGrid = boost_model_grid,
+                verbose = FALSE)
+print(pca_model_optimized)
+plot(pca_model_optimized)
+
+pca_model_optimized_rds <- write_rds(pca_model_optimized, "pca_model_optimized.rds")
+```
+
+**Testing the Boosting Models**
+``` {r Boosting Testing}
+regular_boost_yhat <- predict(r_boost_model_optimized, newdata=regular_test)
+one_hot_boost_yhat  <- predict(one_hot_boost_model_optimized,   newdata=one_hot_test)
+pca_boost_yhat =  predict(pca_model_optimized,   newdata=pca_test)
+
+# Comparing the regular dataset and the one-hot encoded dataset predictions
+plot(regular_boost_yhat, one_hot_boost_yhat)
+cor(regular_boost_yhat, one_hot_boost_yhat)
+abline(0,1)
+
+# Out of Sample RMSE's
+regular_boost_rmse <- sqrt(mean( (regular_test$popularity - regular_boost_yhat)^2 ))
+one_hot_boost_rmse <- sqrt(mean( (one_hot_test$popularity - one_hot_boost_yhat)^2 ))
+pca_rmse <- sqrt(mean( (pca_train$popularity - pca_boost_yhat)^2 ))
+
+regular_boost_rmse
+one_hot_boost_rmse
+pca_rmse
+
+reg_boost_imp <- varImp(r_boost_model_optimized)
+one_hot_boost_imp <- varImp(one_hot_boost_model_optimized)
+pca_boost_imp <- varImp(pca_model_optimized)
+```
